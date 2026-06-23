@@ -5,11 +5,100 @@
 #include <thread>
 #include <chrono>
 
-static double g_q      [JOINT_NUM]{};
-static double g_dq     [JOINT_NUM]{};
-static double g_tau    [JOINT_NUM]{};
-static double g_motor_q[JOINT_NUM]{};
+/* =========================================================
+ * 扭矩常数表  Kt（N·m / A），下标与 JointID 枚举严格对应
+ *
+ * 换算关系：
+ *   输入（电机→算法）：tau_Nm  = current_mA / 1000.0 * Kt
+ *   输出（算法→电机）：current_mA = (int32_t)(tau_Nm / Kt * 1000.0)
+ *
+ * 下表为占位标定值，须根据各关节实际电机规格书替换。
+ * ========================================================= */
+static constexpr double KT[JOINT_NUM] = 
+{
+//  关节                    Kt (N·m/A)   备注
+    4.53,   // L_HIP            大力矩髋关节电机
+    4.53,   // L_KNEE           大力矩膝关节电机
+    3.20,   // L_ANKLE          中力矩踝关节电机
+    4.53,   // R_HIP
+    4.53,   // R_KNEE
+    3.20,   // R_ANKLE
+    2.10,   // L_SHOULDER_FLEX  轻量肩屈伸电机
+    2.10,   // L_SHOULDER_ABD
+    1.50,   // L_SHOULDER_ROT   旋转自由度力矩需求低
+    2.80,   // L_ELBOW
+    1.20,   // L_WRIST
+    2.10,   // R_SHOULDER_FLEX
+    2.10,   // R_SHOULDER_ABD
+    1.50,   // R_SHOULDER_ROT
+    2.80,   // R_ELBOW
+    1.20,   // R_WRIST
+};
 
+/* =========================================================
+ * 减速比表（无量纲），下标与 JointID 枚举严格对应
+ *
+ * 换算关系：
+ *   输入（内圈编码器→关节空间）：q_joint = rotor_rad / GEAR_RATIO
+ *   仿真（关节空间→转子）：      rotor_rad = q_joint  * GEAR_RATIO
+ *
+ * 下表为占位值，须根据各关节实际减速器规格书替换。
+ * ========================================================= */
+static constexpr double GEAR_RATIO[JOINT_NUM] =
+{
+//  关节                    减速比    备注
+    50.0,   // L_HIP            谐波减速
+    50.0,   // L_KNEE
+    36.0,   // L_ANKLE          行星减速
+    50.0,   // R_HIP
+    50.0,   // R_KNEE
+    36.0,   // R_ANKLE
+    30.0,   // L_SHOULDER_FLEX  轻量关节
+    30.0,   // L_SHOULDER_ABD
+    20.0,   // L_SHOULDER_ROT
+    36.0,   // L_ELBOW
+    20.0,   // L_WRIST
+    30.0,   // R_SHOULDER_FLEX
+    30.0,   // R_SHOULDER_ABD
+    20.0,   // R_SHOULDER_ROT
+    36.0,   // R_ELBOW
+    20.0,   // R_WRIST
+};
+
+/* ── 硬件层缓冲（模拟电机驱动器原始数据）──────────────────────────────────────
+ * 真实系统：由底层通信帧填充
+ * 仿真：由 applyOutput() 的植物模型反填
+ * ──────────────────────────────────────────────────────────────────────────── */
+static double  g_q          [JOINT_NUM]{};   // 外圈编码器关节角（rad）
+static double  g_rotor_q    [JOINT_NUM]{};   // 内圈编码器转子角（rad，硬件原始值）
+static double  g_dq         [JOINT_NUM]{};   // 关节角速度（rad/s，外圈）
+static int32_t g_current_mA [JOINT_NUM]{};   // 电机实际电流（mA，驱动器反馈）
+
+/* ── 输入路径：
+ *     ① 转子角  → 关节角：q_joint = g_rotor_q / GEAR_RATIO
+ *     ② 电流(mA)→ 扭矩(N·m)：tau = current_mA / 1000.0 * KT
+ * ──────────────────────────────────────────────────────────────────────────── */
+static void readMotorFeedback()
+{
+    double motor_q_joint[JOINT_NUM]{};   // 内圈编码器换算关节角（rad）
+    double g_tau        [JOINT_NUM]{};
+
+    for (int j = 0; j < JOINT_NUM; ++j)
+    {
+        motor_q_joint[j] = g_rotor_q[j] / GEAR_RATIO[j];
+        g_tau[j]         = (g_current_mA[j] / 1000.0) * KT[j];
+    }
+
+    g_robot.setFeedback(motor_q_joint, g_q, g_dq, g_tau);
+}
+
+/* ── 输出路径：扭矩(N·m) → 电流指令(mA) → 电机驱动器 ───────────────────────
+ *
+ *   current_mA[j] = (int32_t)(cmd_tau[j] / KT[j] * 1000.0)
+ *
+ * 真实系统调用：motor_driver[j].setCurrentMA(current_mA)
+ * 仿真：将电流指令折算回扭矩，驱动植物模型更新位置/速度，再反填电流反馈。
+ * ──────────────────────────────────────────────────────────────────────────── */
 static void applyOutput()
 {
     const double dt    = g_robot.data.dt_s;
@@ -19,17 +108,24 @@ static void applyOutput()
     {
         if (!g_robot.isActive(static_cast<JointID>(j))) continue;
 
-        const double q_ref  = g_robot.output.cmd_q  [j];  // 期望关节角（rad）
-        const double dq_ref = g_robot.output.cmd_dq [j];  // 期望关节速度（rad/s）
-        const double tau    = g_robot.output.cmd_tau [j];  // 阻抗力矩指令（N·m）
+        const double cmd_tau = g_robot.output.cmd_tau[j];   // 算法库输出力矩（N·m）
 
-        // 真实系统：motor_driver[j].setCurrentMA((int32_t)(tau / Kt * 1000.0));
+        // ── 输出路径：N·m → mA ──────────────────────────────────────────────
+        const int32_t cmd_current_mA = static_cast<int32_t>(cmd_tau / KT[j] * 1000.0);
+        // 真实系统：motor_driver[j].setCurrentMA(cmd_current_mA);
 
-        // 仿真植物模型：位置速度混合跟随
+        // ── 仿真植物模型：电流→力矩→运动学 ────────────────────────────────
+        const double sim_tau = (cmd_current_mA / 1000.0) * KT[j];  // 量化回折
+
+        const double q_ref  = g_robot.output.cmd_q [j];
+        const double dq_ref = g_robot.output.cmd_dq[j];
         g_dq[j]      = (q_ref - g_q[j]) * alpha / dt + dq_ref * (1.0 - alpha);
         g_q[j]      += g_dq[j] * dt;
-        g_motor_q[j] = g_q[j];
-        g_tau[j]     = tau;
+        // 仿真：转子角 = 关节角 × 减速比（真实系统由内圈编码器直接读取）
+        g_rotor_q[j] = g_q[j] * GEAR_RATIO[j];
+
+        // 仿真反填电流反馈（真实系统由驱动器帧填充）
+        g_current_mA[j] = static_cast<int32_t>(sim_tau / KT[j] * 1000.0);
     }
 }
 
@@ -113,7 +209,7 @@ int main()
     for (int i = 0; i < 500; ++i)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
-        g_robot.setFeedback(g_motor_q, g_q, g_dq, g_tau);
+        readMotorFeedback();
         updateImuSim(time_s);
         g_robot.updateAll();
         applyOutput();
@@ -125,7 +221,7 @@ int main()
     for (int i = 0; i < 750; ++i)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
-        g_robot.setFeedback(g_motor_q, g_q, g_dq, g_tau);
+        readMotorFeedback();
         updateImuSim(time_s);
         g_robot.updateAll();
         applyOutput();
@@ -144,7 +240,7 @@ int main()
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
 
-        g_robot.setFeedback(g_motor_q, g_q, g_dq, g_tau);
+        readMotorFeedback();
         updateImuSim(time_s);
 
         g_robot.setTarget(JointID::L_HIP,
@@ -189,7 +285,7 @@ int main()
     while (g_robot.getState() == RobotStatusMachine::PAUSING) 
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(4));
-        g_robot.setFeedback(g_motor_q, g_q, g_dq, g_tau);
+        readMotorFeedback();
         updateImuSim(time_s);
         g_robot.updateAll();
         applyOutput();

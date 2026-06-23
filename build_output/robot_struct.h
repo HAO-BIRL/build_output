@@ -314,9 +314,12 @@ struct RobotStatus
     double act_dq     [JOINT_NUM]{};  // 关节实际角速度（rad/s）
     double act_torque [JOINT_NUM]{};  // 关节实际力矩（N·m）
 
-    // ── 实际反馈（内圈编码器）────────────────────────────────────────────────
-    double act_motor_q  [JOINT_NUM]{};  // 电机输出轴角度（rad）
-    double act_motor_dq [JOINT_NUM]{};  // 电机输出轴角速度（rad/s）
+    // ── 实际反馈（内圈编码器，已由外部完成减速比换算至关节空间）──────────────
+    // 换算规则（在 setFeedback 调用前由应用层完成）：
+    //   act_motor_q  = 转子角（rad）  / 减速比
+    //   act_motor_dq = 转子角速度（rad/s）/ 减速比
+    double act_motor_q  [JOINT_NUM]{};  // 内圈编码器换算关节角（rad）
+    double act_motor_dq [JOINT_NUM]{};  // 内圈编码器换算关节角速度（rad/s）
     double act_motor_i  [JOINT_NUM]{};  // 电机电流（A）
 
     // ── 期望指令（控制器下发值）────────────────────────────────────────────────
